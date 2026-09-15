@@ -1,0 +1,146 @@
+name: 'Lumi Accessibility Scan'
+description: 'Scan a URL for WCAG 2.2 accessibility issues using Lumi. Fails the workflow if the score drops below your threshold.'
+author: 'Livana Group'
+
+branding:
+  icon: 'check-circle'
+  color: 'purple'
+
+inputs:
+  api-key:
+    description: 'Your Lumi API key (lsk_live_...). Store this as a repository secret.'
+    required: true
+  url:
+    description: 'The URL to scan.'
+    required: true
+  fail-below:
+    description: 'Fail the workflow if the accessibility score is below this threshold (0-100).'
+    required: false
+    default: '0'
+  wait-timeout:
+    description: 'Maximum seconds to wait for scan results (default: 300).'
+    required: false
+    default: '300'
+  api-url:
+    description: 'Lumi API base URL. Override for self-hosted instances.'
+    required: false
+    default: 'https://lumi.livana.io'
+
+outputs:
+  score:
+    description: 'The accessibility score (0-100).'
+    value: ${{ steps.scan.outputs.score }}
+  total-issues:
+    description: 'Total number of accessibility issues found.'
+    value: ${{ steps.scan.outputs.total-issues }}
+  critical-count:
+    description: 'Number of critical issues.'
+    value: ${{ steps.scan.outputs.critical-count }}
+  serious-count:
+    description: 'Number of serious issues.'
+    value: ${{ steps.scan.outputs.serious-count }}
+  scan-id:
+    description: 'The Lumi scan ID for linking to the full report.'
+    value: ${{ steps.scan.outputs.scan-id }}
+  report-url:
+    description: 'Direct link to the scan results in the Lumi dashboard.'
+    value: ${{ steps.scan.outputs.report-url }}
+  pass:
+    description: 'Whether the scan passed the fail-below threshold (true/false).'
+    value: ${{ steps.scan.outputs.pass }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Run Lumi scan
+      id: scan
+      shell: bash
+      env:
+        LUMI_API_KEY: ${{ inputs.api-key }}
+        LUMI_URL: ${{ inputs.url }}
+        LUMI_FAIL_BELOW: ${{ inputs.fail-below }}
+        LUMI_TIMEOUT: ${{ inputs.wait-timeout }}
+        LUMI_API_URL: ${{ inputs.api-url }}
+      run: |
+        set -euo pipefail
+
+        # Trigger the scan
+        RESPONSE=$(curl -sf \
+          -X POST "${LUMI_API_URL}/api/v1/scans" \
+          -H "Authorization: Bearer ${LUMI_API_KEY}" \
+          -H "Content-Type: application/json" \
+          -d "{\"url\": \"${LUMI_URL}\", \"waitForResult\": true, \"failBelow\": ${LUMI_FAIL_BELOW}}" \
+          --max-time "${LUMI_TIMEOUT}" \
+          2>&1) || {
+          echo "::error::Failed to reach the Lumi API. Check your API key and URL."
+          exit 1
+        }
+
+        # Parse the response
+        SCORE=$(echo "$RESPONSE" | jq -r '.score // empty')
+        TOTAL=$(echo "$RESPONSE" | jq -r '.totalIssues // 0')
+        CRITICAL=$(echo "$RESPONSE" | jq -r '.criticalCount // 0')
+        SERIOUS=$(echo "$RESPONSE" | jq -r '.seriousCount // 0')
+        SCAN_ID=$(echo "$RESPONSE" | jq -r '.scanId // empty')
+        PASS=$(echo "$RESPONSE" | jq -r '.pass // true')
+        STATUS=$(echo "$RESPONSE" | jq -r '.status // empty')
+
+        # Handle scan still running (timeout)
+        if [ "$STATUS" = "running" ] || [ "$STATUS" = "queued" ]; then
+          echo "::warning::Scan is still running after ${LUMI_TIMEOUT}s. Check results at ${LUMI_API_URL}/scans/${SCAN_ID}"
+          echo "score=" >> "$GITHUB_OUTPUT"
+          echo "total-issues=" >> "$GITHUB_OUTPUT"
+          echo "critical-count=" >> "$GITHUB_OUTPUT"
+          echo "serious-count=" >> "$GITHUB_OUTPUT"
+          echo "scan-id=${SCAN_ID}" >> "$GITHUB_OUTPUT"
+          echo "report-url=${LUMI_API_URL}/scans/${SCAN_ID}" >> "$GITHUB_OUTPUT"
+          echo "pass=true" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        # Handle scan failure
+        if [ "$STATUS" = "failed" ]; then
+          ERROR=$(echo "$RESPONSE" | jq -r '.errorMessage // "Unknown error"')
+          echo "::error::Scan failed: ${ERROR}"
+          exit 1
+        fi
+
+        # Handle missing score (unexpected response)
+        if [ -z "$SCORE" ]; then
+          echo "::error::Unexpected API response. No score returned."
+          echo "$RESPONSE" | head -c 500
+          exit 1
+        fi
+
+        REPORT_URL="${LUMI_API_URL}/scans/${SCAN_ID}"
+
+        # Set outputs
+        echo "score=${SCORE}" >> "$GITHUB_OUTPUT"
+        echo "total-issues=${TOTAL}" >> "$GITHUB_OUTPUT"
+        echo "critical-count=${CRITICAL}" >> "$GITHUB_OUTPUT"
+        echo "serious-count=${SERIOUS}" >> "$GITHUB_OUTPUT"
+        echo "scan-id=${SCAN_ID}" >> "$GITHUB_OUTPUT"
+        echo "report-url=${REPORT_URL}" >> "$GITHUB_OUTPUT"
+        echo "pass=${PASS}" >> "$GITHUB_OUTPUT"
+
+        # Summary
+        echo "### Lumi Accessibility Scan" >> "$GITHUB_STEP_SUMMARY"
+        echo "" >> "$GITHUB_STEP_SUMMARY"
+        echo "| Metric | Value |" >> "$GITHUB_STEP_SUMMARY"
+        echo "|--------|-------|" >> "$GITHUB_STEP_SUMMARY"
+        echo "| **Score** | ${SCORE}/100 |" >> "$GITHUB_STEP_SUMMARY"
+        echo "| **Issues** | ${TOTAL} (${CRITICAL} critical, ${SERIOUS} serious) |" >> "$GITHUB_STEP_SUMMARY"
+        echo "| **Threshold** | ${LUMI_FAIL_BELOW} |" >> "$GITHUB_STEP_SUMMARY"
+        echo "| **Result** | $([ \"$PASS\" = 'true' ] && echo '✅ Passed' || echo '❌ Failed') |" >> "$GITHUB_STEP_SUMMARY"
+        echo "" >> "$GITHUB_STEP_SUMMARY"
+        echo "[View full report](${REPORT_URL})" >> "$GITHUB_STEP_SUMMARY"
+
+        # Log
+        echo "Score: ${SCORE}/100 | Issues: ${TOTAL} (${CRITICAL} critical, ${SERIOUS} serious) | Threshold: ${LUMI_FAIL_BELOW} | Pass: ${PASS}"
+        echo "Report: ${REPORT_URL}"
+
+        # Fail the step if below threshold
+        if [ "$PASS" = "false" ]; then
+          echo "::error::Accessibility score ${SCORE} is below the threshold of ${LUMI_FAIL_BELOW}. See ${REPORT_URL}"
+          exit 1
+        fi
